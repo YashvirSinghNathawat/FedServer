@@ -184,6 +184,7 @@ async def start_federated_learning(session_id: str):
 
         # Start Training
         for i in range(1, session_data['max_round'] + 1):
+            await asyncio.sleep(0)
             print("-" * 50)
             federated_manager.federated_sessions[session_id]['curr_round'] = i
             print(f"Round {i}")
@@ -195,7 +196,7 @@ async def start_federated_learning(session_id: str):
             federated_manager.aggregate_weights_fedAvg_Neural(session_id)
 
             ################## Testing start
-            results = test.start_test(federated_manager.federated_sessions[session_id]['global_parameters'])
+            results = await asyncio.to_thread(test.start_test, federated_manager.federated_sessions[session_id]['global_parameters'])
             print("Global test results: ", results)
             ################## Testing end
 
