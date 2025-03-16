@@ -10,4 +10,4 @@ aggregated_sums.txt
 .idea
 /.vscode
 .vscode
-.fedserver
+/backend/venv
