@@ -1,358 +1,430 @@
-from fastapi import FastAPI, BackgroundTasks, Request, HTTPException, WebSocket, WebSocketDisconnect
-from schema import FederatedLearningInfo, User, Parameter, CreateFederatedLearning, ClientFederatedResponse, \
-    ClientReceiveParameters
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.cors import CORSMiddleware
-from sse_starlette.sse import EventSourceResponse
-from utility.FederatedLearning import FederatedLearning
-from utility.ConnectManager import ConnectionManager
-from utility.Server import Server
 import asyncio
+from datetime import datetime
 import json
-import asyncio
-import uuid
-from utility.test import Test
+from typing import Dict
+from fastapi import BackgroundTasks, FastAPI, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from sqlalchemy import Null, and_, null, update
+from sqlalchemy.orm import Session
+# from models import User, Base
+from schema import CreateFederatedLearning, ClientFederatedResponse, ClientModleIdResponse, ClientReceiveParameters
+from sse_starlette import EventSourceResponse
+
+from models.FederatedSession import FederatedSession, FederatedSessionClient
+from helpers.federated_learning import start_federated_learning
+from helpers.websocket import ConnectionManager
+from utility.FederatedLearning import FederatedLearning
+from db import get_db,engine
+from models.User import User, Base
+from schemas.UserSchema import RefreshToken, UserCreate, UserLogin, ClientSessionStatusSchema
+from helpers.auth import create_refresh_token, decode_refresh_token, get_password_hash, verify_password, create_access_token, get_current_user
+from dotenv import load_dotenv
+from api.dataset_api import dataset_router
 import os
 
-'''
-    Naming Conventions as per PEP- https://peps.python.org/pep-0008/#function-and-variable-names
-    Classes - CapWords Convention
-    Methods - Function names should be lowercase, with words separated by underscores as necessary to improve readability.
-    Variables - Variable names follow the same convention as function names.
-'''
+from utility.user import get_unnotified_notifications
+# from db import SessionLocal
 
 
+load_dotenv()
+
+# Create FastAPI app
 app = FastAPI()
-origins = ["*"]
+
+client1_url = os.getenv("CLIENT1_URL", "http://default-url.com")
+origins = [ 
+    "http://localhost:5173",
+    "http://localhost:5174",
+    client1_url  
+]
+print(origins)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Or specify allowed methods, e.g., ["GET", "POST"]
+    allow_headers=["*"],  # Or specify allowed headers
 )
 
-event = asyncio.Event()
 
-clients_data = []
+# Create all tables
+# Base.metadata.create_all(bind=engine)
 
+websocket_manager = ConnectionManager()
+        
+# Signup route
+@app.post("/signup", status_code=201)
+def signup(user: UserCreate, db: Session = Depends(get_db)):
+    # Check if user already exists
+    if db.query(User).filter(User.username == user.username).first():
+        raise HTTPException(status_code=400, detail="Username already taken")
+    
+    # if db.query(User).filter(User.email == user.email).first():
+    #     raise HTTPException(status_code=400, detail="Email already registered")
 
-class MessageType:
-    GET_MODEL_PARAMETERS_START_BACKGROUND_PROCESS = "get_model_parameters_start_background_process"
-    START_TRAINING = "start_training"
+    # Create new user
+    new_user = User(
+        username=user.username,
+        data_url=user.data_url,
+        hashed_password=get_password_hash(user.password)
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return {"message": "User created successfully"}
 
+# Login route
+@app.post("/login")
+def login(user: UserLogin, db: Session = Depends(get_db)):
+    def is_invalid(db_user: User):
+        not verify_password(user.password, db_user.hashed_password)
+        
+    return create_tokens(
+        db,
+        user.username,
+        HTTPException(status_code=400, detail="Invalid credentials"),
+        is_invalid
+    )
 
-# Utility Function
-def generate_unique_token():
-    token = str(uuid.uuid4())
-    return token
+@app.post("/refresh-token")
+def refresh_token(token: RefreshToken, db: Session = Depends(get_db)):
+    try:
+        # Decode the refresh token
+        payload = decode_refresh_token(token.refresh_token)
+        username: str = payload.get("sub")
+        
+        expiry = datetime.fromtimestamp(payload.get('exp'))
+        
+        if(expiry > datetime.now()):
+            if username is None:
+                raise HTTPException(status_code=401, detail="Invalid token")
+            
+            def validate_user(db_user: User):
+                return db_user.refresh_token != token.refresh_token
 
-
-def generate_session_token():
-    session_token = generate_unique_token()
-    # Check if token is already assigned to other federated session
-    return session_token
-
-
-def generate_user_token():
-    user_token = generate_unique_token()
-    # Check if token is already assigned to other federated session
-    return user_token
-
-
-# Usage
-federated_manager = FederatedLearning()
-connection_manager = ConnectionManager()
-
-
-async def wait_for_client_confirmation(session_id: str):
-    session_data = federated_manager.federated_sessions[session_id]
-    all_ready_for_training = False
-
-    while not all_ready_for_training:
-        await asyncio.sleep(5)
-        all_ready_for_training = all(client['status'] != 1 for client in session_data['clients_status'].values())
-        print("Waiting for client confirmations....Stage 1")
-
-    print("All Clients have taken their decision.")
-
-
-async def send_message_with_type(client_id: str, message_type: str, data: dict, session_id: str):
-    message = {
-        "type": message_type,
-        "data": data,
-        "session_id": session_id
-    }
-    json_message = json.dumps(message)
-    print("json model sent before the training signal: ", json_message)
-    await connection_manager.send_message(json_message, client_id)
-
-
-async def send_model_configuration(client_id: str, session_id: str):
-    model_data = federated_manager.federated_sessions[session_id]
-    model_config = model_data['federated_info']
-    model_config_dict = model_config.dict()  # Convert to dictionary
-    await send_message_with_type(client_id, MessageType.GET_MODEL_PARAMETERS_START_BACKGROUND_PROCESS,
-                                 model_config_dict, session_id)
-
-
-async def wait_for_all_clients_to_stage_four(session_id: str):
-    # Implement the logic to wait for all clients to confirm that they have started background process
-    session_data = federated_manager.federated_sessions[session_id]
-    interested_clients = session_data['interested_clients']
-
-    while True:
-        all_clients_ready = True
-        for client_id in interested_clients:
-            if session_data['clients_status'][client_id]['status'] != 4:
-                all_clients_ready = False
-                break
-
-        if all_clients_ready:
-            print("All clients have reached stage four.")
-            break
+            return create_tokens(
+                db,
+                username,
+                HTTPException(status_code=401, detail="Invalid token"),
+                validate_user
+            )
         else:
-            await asyncio.sleep(5)
-            print("Waiting for all clients to reach stage four.")
+            raise HTTPException(status_code=440, detail="Session Timed Out!")
+    except:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
+    
+def create_tokens(db: Session, username: str, exception: HTTPException, check = null):
+    # Verify if the refresh token exists in the database
+    db_user = db.query(User).filter(User.username == username).first()
+    if (not db_user) or (check and check(db_user)):
+        raise exception
+    
+    # Create a new access token
+    new_access_token = create_access_token(data={"sub": db_user.username})
+    new_refresh_token = create_refresh_token(data={"sub": db_user.username})
+    
+    # Store refresh token in database
+    db_user.refresh_token = new_refresh_token
+    db.commit()
 
-async def send_model_configs_and_wait_for_confirmation(session_id: str):
-    interested_clients = federated_manager.federated_sessions[session_id]['interested_clients']
-    for client in interested_clients:
-        await send_model_configuration(client, session_id)
-
-    # Wait for all clients to confirm they have started their background process
-    await wait_for_all_clients_to_stage_four(session_id)
-
-
-async def send_training_signal_to_clients(session_id: str):
-    session_data = federated_manager.federated_sessions[session_id]
-    interested_clients = session_data['interested_clients']
-    data = {
-        'session_id': session_id  #dummy data, not accesses at client side
+    return {
+        "access_token": new_access_token,
+        "refresh_token": new_refresh_token,
+        "token_type": "bearer"
     }
-    print("Before Sending Signal : ")
-    for client_id in interested_clients:
-        print(client_id)
-        await send_message_with_type(client_id, MessageType.START_TRAINING, data,
-                                     session_id)  #session_id is dummy data here
-    print("Training Signal Sent to all clients")
 
 
-async def send_training_signal_and_wait_for_clients_training(session_id: str):
-    await send_training_signal_to_clients(session_id)
+@app.post("/logout")
+def logout(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    current_user.refresh_token = None
+    db.commit()
+    return {"msg": "User logged out"}
 
-    session_data = federated_manager.federated_sessions[session_id]
-    num_interested_clients = len(session_data['interested_clients'])
-    print("Error Check : ", len(session_data['client_parameters']), num_interested_clients)
-    while len(session_data['client_parameters']) < num_interested_clients:
-        await asyncio.sleep(5)
-        print(f"Waiting for {num_interested_clients - len(session_data['client_parameters'])}")
+# Protected API route
+@app.get("/users/me")
+def read_users_me(current_user: User = Depends(get_current_user)):
+    return {"username": current_user.username}
 
-    # print("All clients have sent parameters. Starting Aggregation...", session_data['client_parameters'])
+@app.get("/client/initiated_sessions", response_model=list[ClientSessionStatusSchema])
+def get_initiated_jobs(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    sessions = db.query(
+            FederatedSession.id,
+            FederatedSession.curr_round,
+            FederatedSession.max_round,
+            FederatedSession.session_price,
+            FederatedSession.training_status,
+            FederatedSessionClient.status.label('client_status')
+        ).outerjoin(
+            FederatedSessionClient,
+            (FederatedSession.id == FederatedSessionClient.session_id) &
+            (FederatedSessionClient.user_id == current_user.id)
+        ).filter(FederatedSession.admin_id == current_user.id).all()
+    
+    return [ClientSessionStatusSchema.model_validate(dict(zip(
+            ["session_id","curr_round", "max_round", "session_price", "training_status", "client_status"], session
+        ))) for session in sessions]
 
-
-async def start_federated_learning(session_id: str):
-    """
-    Background task to manage federated learning rounds.
-
-    This function runs in the background, waiting for client responses before proceeding with each round
-    of federated learning.
-
-    Each round consists of:
-    1. Setting the current round number (`curr_round`) in the server.
-    2. Printing round information.
-    3. Receiving parameters from clients.
-    4. Aggregating weights using federated averaging with neural networks.
-
-    """
-    try:
-        session_data = federated_manager.federated_sessions[
-            session_id]  # session_data points to same object variables in Python that point to mutable objects (like dictionaries) actually reference the same underlying object in memory.
-
-        # Wait for client confirmation of interest
-        await wait_for_client_confirmation(session_id)
-
-        # Send Model Configurations to interested clients and wait for their confirmation
-        await send_model_configs_and_wait_for_confirmation(session_id)
-
-        #############################################
-        # code used to get instance of testing unit
-        # Here Input has to be taken in future for the metrics
-        test = Test(session_id, session_data)
-        #############################################
-
-        # Start Training
-        for i in range(1, session_data['max_round'] + 1):
-            print("-" * 50)
-            federated_manager.federated_sessions[session_id]['curr_round'] = i
-            print(f"Round {i}")
-            print("-" * 50)
-
-            await send_training_signal_and_wait_for_clients_training(session_id)
-            # Aggregate
-            print("Done upto just before aggregation...")
-            federated_manager.aggregate_weights_fedAvg_Neural(session_id)
-
-            ################## Testing start
-            results = test.start_test(federated_manager.federated_sessions[session_id]['global_parameters'])
-            print("Global test results: ", results)
-            ################## Testing end
-
-        # Save test results for future reference
-        """ Yashvir: here you can delete the data of this session from the federated_sessions dictionary after saving the results 
-            , saved results contains session_data and test_results across all rounds
-        """
-        test.save_test_results()
-    except Exception as e:
-        print(f"Error in Starting Background Process: {e}")
+@app.get("/client/participated_sessions", response_model = list[ClientSessionStatusSchema])
+def get_participated_sessions(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    sessions = db.query(
+        FederatedSession.curr_round,
+        FederatedSession.max_round,
+        FederatedSession.session_price,
+        FederatedSession.training_status,
+        FederatedSessionClient.status.label("client_status")
+    ).join(
+        FederatedSessionClient, FederatedSession.id == FederatedSessionClient.session_id
+    ).filter(
+        FederatedSessionClient.user_id == current_user.id
+    ).all()
+    return [ClientSessionStatusSchema.model_validate(dict(zip(
+            ["curr_round", "max_round", "session_price", "training_status", "client_status"], session
+        ))) for session in sessions]
+    
 
 
-def add_interested_user_to_session(client_token, session_token: str, request: Request, admin):
-    """
-    Generates a token for user which will be used to validate the sender, and the token will be bound to a spefic session.
-    :param client_token: This will be authentication token for a user in future when establish authentication each user has a unique user_id
-    :param session_token: This will be unique token for each session
-    :param admin: This user is admin of this request or not
-    :param request:
-    :return:
-    """
-    federated_manager.federated_sessions[session_token]['clients_status'][client_token]['status'] = 2
-    federated_manager.federated_sessions[session_token]["interested_clients"][client_token] = {
-        "ip": request.client.host,
-    }
-    if admin:
-        federated_manager.federated_sessions[session_token]["admin"] = client_token
-
-
-@app.websocket("/ws/{client_id}")
-async def websocket_endpoint(websocket: WebSocket, client_id: str):
-    await connection_manager.connect(websocket, client_id)
-    try:
+@app.get("/notifications/stream")
+async def notifications_stream(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    async def event_generator():
         while True:
-            data = await websocket.receive_text()
-            message = json.loads(data)
-            if message.get("type") == "pong":
-                print(f"Received pong from client {client_id}")
-                continue
-            print(f"Received message: {message}")
+            # Check if client has disconnected
+            if await request.is_disconnected():
+                break
+            
+            # # Expire all cached objects to force fresh queries
+            # db.expire_all()
+        
+            # Fetch notifications for the current user
+            user_notifications = get_unnotified_notifications(user = current_user, db = db)
+            
+            if(len(user_notifications) > 0):
+                data = [n.message for n in user_notifications]
 
-    except WebSocketDisconnect:
-        connection_manager.disconnect(client_id)
-        print(f"Client {client_id} disconnected")
-    except Exception as e:
-        print(f"An error occurred: {str(e)}")
+                # Send the data as an SSE event
+                yield {
+                    "event": "new_notifications",   
+                    "data": json.dumps(data),
+                }
+                
+
+                for notification in user_notifications:
+                    notification.notified_at = datetime.now()
+                db.commit()
+
+            # Wait for 5 seconds before sending the next update
+            await asyncio.sleep(5)
+
+    return EventSourceResponse(event_generator())
 
 
-
-
-@app.post('/sign-in')
-def signIn(request: User):
-    user_token = generate_user_token()
-    clients_data.append(user_token)
-    print(f"{request.name} is registered")
-    return {"message": "Client Registered Successfully", "client_token": user_token}
-
+federated_manager = FederatedLearning()
 
 @app.post("/create-federated-session")
-def create_federated_session(federated_details: CreateFederatedLearning, request: Request,
-                             background_tasks: BackgroundTasks):
-    session_token = generate_session_token()
-    federated_manager.create_federated_session(session_token, federated_details.fed_info, clients_data)
-
-    add_interested_user_to_session(federated_details.client_token, session_token, request, admin=True)
+async def create_federated_session(
+    federated_details: CreateFederatedLearning,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):  
+    print(federated_details.fed_info)
+    session: FederatedSession = federated_manager.create_federated_session(current_user, federated_details.fed_info, request.client.host)
+    
+    # await websocket_manager.broadcast({
+    #     'type': "new-session",
+    #     'message': "New Federated Session Avaliable!"
+    # })
+    
+    # message = {
+    #     'type': "new-session",
+    #     'message': "New Federated Session Avaliable!",
+    #     'session_id': session.id
+    # }
+    
+    # add_notifications_for_recently_active_users(db=db, message=message, valid_until=session.wait_till, excluded_users=[current_user])
+    
     try:
-        background_tasks.add_task(start_federated_learning, session_token)
+        background_tasks.add_task(start_federated_learning, federated_manager, current_user, session, db)
         print("Background Task Added")
     except Exception as e:
         print(f"An error occurred while adding background process {Exception}")
         return {"message": "An error occurred while starting federated learning."}
-
-    return {"message": "Federated Session has been created!"}
+    
+    return {
+        "message": "Federated Session has been created!",
+        "session_id": session.id
+    }
 
 
 @app.get('/get-all-federated-sessions')
-def get_all_federated_session():
-    federated_session = []
-    for session_id, session_data in federated_manager.federated_sessions.items():
-        federated_session.append({
-            'session_id': session_id,
-            "training_status": session_data["training_status"]
-        })
-    return {"federated_session": federated_session}
-
+def get_all_federated_session(current_user: User = Depends(get_current_user)):
+    return [
+        {
+            'id': id,
+            'training_status': training_status,
+            'name': federated_info.get('organisation_name')
+        }
+        for [id, training_status, federated_info]
+        in federated_manager.get_my_sessions(current_user)
+    ]
 
 @app.get('/get-federated-session/{session_id}')
-def get_federated_session(session_id: str, client_id: str):
-    first_session_key = list(federated_manager.federated_sessions.keys())[0]
+def get_federated_session(session_id: int, current_user: User = Depends(get_current_user)):
     try:
-        federated_session_data = federated_manager.federated_sessions[session_id]
+        federated_session_data = federated_manager.get_session(session_id)
+        client = next((client for client in federated_session_data.clients if client.user_id == current_user.id), None)
+
         federated_response = {
-            'federated_info': federated_session_data['federated_info'],
-            'training_status': federated_session_data['training_status'],
-            'client_status': federated_session_data['clients_status'][client_id]['status']
+            'federated_info': federated_session_data.federated_info,
+            'training_status': federated_session_data.training_status,
+            'client_status': client.status if client else 1,
+            'session_price': federated_session_data.session_price
         }
+
         return federated_response
     except KeyError:
         raise HTTPException(status_code=404, detail="Session not found")
+    
+
+@app.post('/submit-client-price-response')
+def submit_client_price_response(client_response: ClientFederatedResponse, request: Request, db: Session = Depends(get_db)):
+    '''
+        decision : 1 means client accepts the price, -1 means client rejects the price
+        training_status = 2 means the training process should start
+    '''
+    try:
+        session_id = client_response.session_id
+        decision = client_response.decision
+        
+        session = federated_manager.get_session(session_id)
+        if(session):
+            # Fetch the FederatedSession by session_id
+            federated_session = db.query(FederatedSession).filter_by(id = session_id).first()
+            if not federated_session:
+                raise HTTPException(status_code=404, detail="Federated session not found")
+            # Update training_status based on the decision
+            if decision == 1:
+                federated_session.training_status = 2  # Update training_status to 2 (start training)
+            elif decision == -1:
+                federated_session.training_status = -1  # Keep or set to a default status for rejection
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid decision value. Must be 1 (accept) or -1 (reject)."
+                )
+            # Commit changes to the database
+            db.commit()
+            
+
+            return {'success': True, 'message': 'Training status updated successfully'}
     except Exception as e:
+        print(e)
         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
-
 @app.post('/submit-client-federated-response')
-def submit_client_federated_response(client_response: ClientFederatedResponse, request: Request):
+def submit_client_federated_response(client_response: ClientFederatedResponse, request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     '''
         decision : 1 means client accepts and 0 means rejects
         client_status = 2 means client has accepted the request
         client_status = 3 means client rejected the request
     '''
-    try:
-        session_id = client_response.session_id
-        client_id = client_response.client_id
-        decision = client_response.decision
-        if decision == 1:
-            federated_manager.federated_sessions[session_id]['clients_status'][client_id]['status'] = 2
-            add_interested_user_to_session(client_id, session_id, request, admin=False)
+    session_id = client_response.session_id
+    decision = client_response.decision
+    client_status = 3
+    if decision == 1:
+        client_status = 2
+    
+    session = federated_manager.get_session(session_id)
+    
+    if(session):
+        client = db.query(FederatedSessionClient).filter_by(session_id = session_id, user_id = current_user.id).first()
+        if not client:
+            federated_session_client = FederatedSessionClient(
+                user_id = current_user.id,
+                session_id = session_id,
+                status = client_status,
+                ip = request.client.host
+            )
+            
+            db.add(federated_session_client)
         else:
-            federated_manager.federated_sessions[session_id]['clients_status'][client_id]['status'] = 3
-        return {'message': 'Client Decision has been saved'}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+            client.status = client_status
+        db.commit()
+    
+    return { 'success': True, 'message': 'Client Decision has been saved'}
 
 
 @app.post('/update-client-status-four')
-def update_client_status_four(request: ClientFederatedResponse):
+def update_client_status_four(request: ClientModleIdResponse, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     '''
         Client have received the model parameters and waiting for server to start training
     '''
-    client_id = request.client_id
-    session_id = request.session_id
-    federated_manager.federated_sessions[session_id]['clients_status'][client_id]['status'] = 4
-    return {'message': 'Client Status Updated to 4'}
 
+    session_id = request.session_id
+    local_model_id = request.local_model_id
+    db.execute(
+        update(FederatedSessionClient)
+        .where(and_(
+            FederatedSessionClient.user_id == current_user.id,
+            FederatedSessionClient.session_id == session_id
+        ))
+        .values(
+            status = 4,
+            local_model_id = local_model_id
+        )
+    )
+    
+    db.commit()
+
+    return {'message': 'Client Status Updated to 4'}
 
 @app.get('/get-model-parameters/{session_id}')
 def get_model_parameters(session_id: str):
     '''
         Client have received the model parameters and waiting for server to start training
     '''
-    global_parameters = federated_manager.federated_sessions[session_id]['global_parameters']
+    global_parameters = json.loads(federated_manager.get_session(session_id).global_parameters)
+    
     response_data = {
         "global_parameters": global_parameters,
         "is_first": 0
     }
-    if len(global_parameters) == 0:
-        response_data['is_first'] = 1
+
+    # Save global_parameters string into a file
+    file_path = "global_parameters.txt"  # Specify the desired file path and name
+    with open(file_path, "a") as file:
+        file.write("\n---\n")  # Add a separator before each new entry
+        file.write(json.dumps(global_parameters))  # Append the JSON string
+        file.write("\n")  # Add a newline after the entry for readability
+    print(f"Global parameters have been saved to {file_path}.")
     return response_data
 
-
 @app.post('/receive-client-parameters')
-def receive_client_parameters(request: ClientReceiveParameters):
+def receive_client_parameters(request: ClientReceiveParameters,  current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     session_id = request.session_id
-    client_id = request.client_id
-    federated_manager.federated_sessions[session_id]['client_parameters'][client_id] = request.client_parameter
+    client_parameter = request.client_parameter
+    
+    session_data = db.query(FederatedSession).filter(FederatedSession.id == session_id).first()
+    
+    if not session_data:
+        raise HTTPException(status_code=404, detail=f"Federated Session with ID {session_id} not found!")
+    
+    # Deserialize client_parameters from JSON to a Python dictionary
+    existing_parameters = json.loads(session_data.client_parameters) if session_data.client_parameters else {}
+    
+    existing_parameters[str(current_user.id)] = client_parameter
+    session_data.client_parameters = json.dumps(existing_parameters)
+    
+    db.commit()
+    
+    # federated_manager.federated_sessions[session_id]['client_parameters'][client_id] = request.client_parameter
     return {"message": "Client Parameters Received"}
-
 
 @app.get('/get-all-completed-trainings')
 def get_training_results():
@@ -388,6 +460,4 @@ def get_training_results(session_id: str):
         return {"message": f"No training results with this session_id"}
 
 
-@app.get('/test')
-def test_server():
-    return {"message": "Server is started..."}
+app.include_router(dataset_router,tags=["Dataset"])
