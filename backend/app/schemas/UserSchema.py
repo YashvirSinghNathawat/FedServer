@@ -1,4 +1,5 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
+from typing import Optional
 
 class UserCreate(BaseModel):
     username: str
@@ -12,3 +13,11 @@ class UserLogin(BaseModel):
     
 class RefreshToken(BaseModel):
     refresh_token: str
+
+class ClientSessionStatusSchema(BaseModel):
+    session_id: int
+    curr_round: int
+    max_round: int
+    session_price: Optional[float]
+    training_status: int
+    client_status: Optional[int]

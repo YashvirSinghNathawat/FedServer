@@ -13,10 +13,50 @@ from db import engine
 from sqlalchemy.orm import Session
 from models.Notification import Notification
 from utility.test import Test
+from models.Benchmark import Benchmark
+from utility.notification import add_notifications_for, add_notifications_for_user, add_notifications_for_recently_active_users
+from utility.SampleSizeEstimation import calculate_required_data_points
 
-from utility.notification import add_notifications_for, add_notifications_for_user
 
 
+def fetch_benchmark_and_calculate_price(session_data: FederatedSession, db: Session)->float :
+    benchmark = db.query(Benchmark).filter(
+            Benchmark.id == 1
+        ).first()
+    if not benchmark:
+        raise ValueError("Benchmark not found!")
+    
+    # Extract benchmark mean and standard deviation
+    metric_name = benchmark.benchmark_metric
+    metrics = benchmark.metrics
+    baseline_mean = metrics[metric_name]["mean"]
+    baseline_std = metrics[metric_name]["std_dev"]
+    
+    new_mean = session_data.federated_info.get("std_mean")
+    new_std = session_data.federated_info.get("std_deviation")
+    
+    if new_mean is None or new_std is None:
+        raise ValueError("New model metrics (std_mean and std_deviation) are missing in session data.")
+    
+    # Extract num_predictors strictly from input_shape
+    input_shape = session_data.federated_info["model_info"].get("input_shape")
+
+    if not input_shape:
+        raise ValueError("Input shape is missing in model_info.")
+
+    try:
+        shape_tuple = eval(input_shape)  # Convert string "(128,128,1)" → tuple (128,128,1)
+        num_predictors = 1
+        for dim in shape_tuple:
+            num_predictors *= dim  # Compute total number of input features
+    except Exception:
+        raise ValueError(f"Invalid input_shape format: {input_shape}")
+    # Calculate the required data points (price)
+    price = calculate_required_data_points(
+        baseline_mean, baseline_std, new_mean, new_std, num_predictors
+    )
+    return price
+    
 async def start_federated_learning(federated_manager: FederatedLearning, user: User, session_data: FederatedSession, db: Session):
     """
     Background task to manage federated learning rounds.
@@ -31,8 +71,39 @@ async def start_federated_learning(federated_manager: FederatedLearning, user: U
     4. Aggregating weights using federated averaging with neural networks.
 
     """
+    
+    # Fetch benchmark stats and calculate required data points (price)
+    required_data_points = fetch_benchmark_and_calculate_price(session_data, db)
+
+    print("Price for Training :", required_data_points)
+    # Store the calculated price in the session
+    federated_session = db.query(FederatedSession).filter_by(id=session_data.id).first()
+    if federated_session:    
+        federated_session.session_price = required_data_points
+        db.commit()
+        db.refresh(federated_session)
+    else:
+        raise ValueError(f"FederatedSession with ID {session_data.id} not found.")
+    
+    # Send the price to the client and wait for approval
+    approved = await wait_for_price_confirmation(federated_manager, session_data.id)
+
+    if not approved:
+        print(f"Client {user.id} declined the price. Aborting training session {session_data.id}.")
+        return  # Stop execution if client rejects price
+
+    print(f"Client {user.id} accepted the price. Starting federated learning session {session_data.id}.")
+    
     # Send the price to the client and wait for approval
     await wait_for_price_confirmation(federated_manager, session_data.id)
+    
+    message = {
+        'type': "new-session",
+        'message': "New Federated Session Avaliable!",
+        'session_id': session_data.id
+    }
+    
+    add_notifications_for_recently_active_users(db=db, message=message, valid_until=session_data.wait_till, excluded_users=[user])
     
     # Wait for client confirmation of interest
     await wait_for_client_confirmation(federated_manager, session_data.id)
@@ -80,16 +151,34 @@ async def start_federated_learning(federated_manager: FederatedLearning, user: U
     print("##########################Training Ends####################################")
 
 
-async def wait_for_price_confirmation(federated_manager: FederatedLearning,session_id: str):
-    price_decision_taken = False
-    while not price_decision_taken:
+async def wait_for_price_confirmation(federated_manager: FederatedLearning, session_id: str, timeout: int = 300):
+    """
+    Asynchronously waits for the client to accept the price before proceeding with federated learning.
+
+    Args:
+        federated_manager (FederatedLearning): The federated learning manager handling sessions.
+        session_id (str): The ID of the federated learning session.
+        timeout (int): Maximum time (in seconds) to wait for the price confirmation. Default is 5 minutes.
+
+    Returns:
+        bool: True if the client accepted the price, False if timeout occurred.
+    """
+    start_time = asyncio.get_event_loop().time()  # Get async time to prevent blocking
+
+    while True:
         session_data = federated_manager.get_session(session_id)
-        price_decision_taken = (session_data.training_status == 2)
-        
-        await asyncio.sleep(5)
-        print("Waiting for Client Price confirmations....Training Status 1")
-    
-    print("Client Accepted the price")
+
+        if session_data.training_status == 2:  # Status 2 means price was accepted
+            print(f"✅ Client accepted the price for session {session_id}. Proceeding with training.")
+            return True
+
+        # Check for timeout
+        if asyncio.get_event_loop().time() - start_time > timeout:
+            print(f"⏳ Timeout: Client did not confirm the price within {timeout} seconds. Aborting session {session_id}.")
+            return False
+
+        print("⌛ Waiting for client price confirmations... (Training Status: 1)")
+        await asyncio.sleep(5)  # Non-blocking sleep
 
 async def wait_for_client_confirmation(federated_manager: FederatedLearning, session_id: int):
     all_ready_for_training = False

@@ -10,14 +10,14 @@ from sqlalchemy.orm import Session
 # from models import User, Base
 from schema import CreateFederatedLearning, ClientFederatedResponse, ClientModleIdResponse, ClientReceiveParameters
 from sse_starlette import EventSourceResponse
-from utility.notification import add_notifications_for_recently_active_users
+
 from models.FederatedSession import FederatedSession, FederatedSessionClient
 from helpers.federated_learning import start_federated_learning
 from helpers.websocket import ConnectionManager
 from utility.FederatedLearning import FederatedLearning
 from db import get_db,engine
 from models.User import User, Base
-from schemas.UserSchema import RefreshToken, UserCreate, UserLogin
+from schemas.UserSchema import RefreshToken, UserCreate, UserLogin, ClientSessionStatusSchema
 from helpers.auth import create_refresh_token, decode_refresh_token, get_password_hash, verify_password, create_access_token, get_current_user
 from dotenv import load_dotenv
 from api.dataset_api import dataset_router
@@ -147,6 +147,42 @@ def logout(current_user: User = Depends(get_current_user), db: Session = Depends
 def read_users_me(current_user: User = Depends(get_current_user)):
     return {"username": current_user.username}
 
+@app.get("/client/initiated_sessions", response_model=list[ClientSessionStatusSchema])
+def get_initiated_jobs(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    sessions = db.query(
+            FederatedSession.id,
+            FederatedSession.curr_round,
+            FederatedSession.max_round,
+            FederatedSession.session_price,
+            FederatedSession.training_status,
+            FederatedSessionClient.status.label('client_status')
+        ).outerjoin(
+            FederatedSessionClient,
+            (FederatedSession.id == FederatedSessionClient.session_id) &
+            (FederatedSessionClient.user_id == current_user.id)
+        ).filter(FederatedSession.admin_id == current_user.id).all()
+    
+    return [ClientSessionStatusSchema.model_validate(dict(zip(
+            ["session_id","curr_round", "max_round", "session_price", "training_status", "client_status"], session
+        ))) for session in sessions]
+
+@app.get("/client/participated_sessions", response_model = list[ClientSessionStatusSchema])
+def get_participated_sessions(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    sessions = db.query(
+        FederatedSession.curr_round,
+        FederatedSession.max_round,
+        FederatedSession.session_price,
+        FederatedSession.training_status,
+        FederatedSessionClient.status.label("client_status")
+    ).join(
+        FederatedSessionClient, FederatedSession.id == FederatedSessionClient.session_id
+    ).filter(
+        FederatedSessionClient.user_id == current_user.id
+    ).all()
+    return [ClientSessionStatusSchema.model_validate(dict(zip(
+            ["curr_round", "max_round", "session_price", "training_status", "client_status"], session
+        ))) for session in sessions]
+    
 
 
 @app.get("/notifications/stream")
@@ -197,7 +233,7 @@ async def create_federated_session(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):  
-    print("Checkpoint 1: ",federated_details)
+    print(federated_details.fed_info)
     session: FederatedSession = federated_manager.create_federated_session(current_user, federated_details.fed_info, request.client.host)
     
     # await websocket_manager.broadcast({
@@ -205,13 +241,13 @@ async def create_federated_session(
     #     'message': "New Federated Session Avaliable!"
     # })
     
-    message = {
-        'type': "new-session",
-        'message': "New Federated Session Avaliable!",
-        'session_id': session.id
-    }
+    # message = {
+    #     'type': "new-session",
+    #     'message': "New Federated Session Avaliable!",
+    #     'session_id': session.id
+    # }
     
-    add_notifications_for_recently_active_users(db=db, message=message, valid_until=session.wait_till, excluded_users=[current_user])
+    # add_notifications_for_recently_active_users(db=db, message=message, valid_until=session.wait_till, excluded_users=[current_user])
     
     try:
         background_tasks.add_task(start_federated_learning, federated_manager, current_user, session, db)
@@ -247,7 +283,8 @@ def get_federated_session(session_id: int, current_user: User = Depends(get_curr
         federated_response = {
             'federated_info': federated_session_data.federated_info,
             'training_status': federated_session_data.training_status,
-            'client_status': client.status if client else 1
+            'client_status': client.status if client else 1,
+            'session_price': federated_session_data.session_price
         }
 
         return federated_response

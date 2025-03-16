@@ -138,6 +138,13 @@ def get_all_benchmarks(
         benchmarks = db.query(Benchmark).all()
     return benchmarks
 
+@dataset_router.get("/benchmarks/{benchmark_id}")
+def get_benchmark(benchmark_id: int, db: Session = Depends(get_db)):
+    benchmark = db.query(Benchmark).filter(Benchmark.id == benchmark_id).first()
+    if not benchmark:
+        raise HTTPException(status_code=404, detail="Benchmark not found")
+    return benchmark
+
 @dataset_router.delete("/benchmarks/delete-benchmark/{benchmark_id}")
 def delete_benchmark(benchmark_id: int, db: Session = Depends(get_db)):
     benchmark = db.query(Benchmark).filter(Benchmark.id == benchmark_id).first()

@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
-from sqlalchemy import JSON, Column, DateTime, ForeignKey, Integer, Null, String, event
+from sqlalchemy import JSON, Column, DateTime, ForeignKey, Integer, Float, String, event
 from sqlalchemy.orm import declared_attr, relationship, Session, with_loader_criteria
 from .Base import Base
 import os
@@ -41,6 +41,7 @@ class FederatedSession(TimestampMixin, Base):
     curr_round = Column(Integer, default=1, nullable=False)
     max_round = Column(Integer, default=3, nullable=False)
     global_parameters = Column(JSON, default='[]', nullable=False)
+    session_price = Column(Float, default= 0, nullable=True)
     # 1 for server waiting for admin to price, 2 for server waiting for all clients and 3 for training starts, 4 for completed
     training_status = Column(Integer, default=1, nullable=False) 
     client_parameters = Column(JSON, default='{}', nullable=False)
